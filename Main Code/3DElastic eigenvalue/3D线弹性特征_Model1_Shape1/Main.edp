@@ -1,0 +1,724 @@
+load "msh3"
+load "tetgen"
+load "distance"
+load "iovtk"
+load "PETSc"
+load "MUMPS_seq"
+include "getARGV.idp"
+verbosity = 0;
+
+real T0 = getARGV("-T0", 0.2);
+real Titer = T0;
+int iterMax = getARGV("-iterMax", 300);
+int TStrategy = getARGV("-TStrategy", 3);       // Runtime parameters are documented in Main.md.
+int TDecayPeriod = getARGV("-TDecayPeriod", 5);
+real TScale = getARGV("-TScale", 0.2);
+int DGSolverMode = getARGV("-DGSolverMode", 1);
+int RedistancePeriod = getARGV("-RedistancePeriod", 20);
+real initialVolumeRatio = getARGV("-InitialVolumeRatio", 0.5);
+real initialVolumeTol = getARGV("-InitialVolumeTol", 1e-5);
+
+real hMeshTarget = 0.09;
+int Nx = 20;
+int Ny = 40;
+int Nz = 20;
+
+real Young = 1.0;
+real nu = 0.3;
+real mu = Young / (2.0 * (1.0 + nu));
+real lameLambda = Young * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+
+real weak = 1e-2;
+real weakM = 1e-4;
+real blockMass = 100.0;
+real gamma = hMeshTarget;
+
+real sigma = 0.0;
+int nev = 6;
+real modeGapTol = 1e-2;
+
+ofstream object("./Output/MainEigen3D.obj");
+string ModelMatlabName = "matlab/ModelEigen3D_Fig77.m";
+
+cout << "Run config: iterMax = " << iterMax
+     << ", T0 = " << T0
+     << ", TStrategy = " << TStrategy
+     << ", TDecayPeriod = " << TDecayPeriod
+     << ", TScale = " << TScale
+     << ", DGSolverMode = " << DGSolverMode
+     << ", RedistancePeriod = " << RedistancePeriod
+     << ", InitialVolumeRatio = " << initialVolumeRatio << endl;
+object << "Run config: iterMax = " << iterMax
+       << ", T0 = " << T0
+       << ", TStrategy = " << TStrategy
+       << ", TDecayPeriod = " << TDecayPeriod
+       << ", TScale = " << TScale
+       << ", DGSolverMode = " << DGSolverMode
+       << ", RedistancePeriod = " << RedistancePeriod
+       << ", InitialVolumeRatio = " << initialVolumeRatio << endl;
+
+macro HeaviSide(phi)
+(
+    (phi > gamma) * weak
+  + (0 < phi && phi <= gamma)
+    * ((1.0 - weak) * (0.5 - phi/gamma + 0.5*phi^2/gamma^2) + weak)
+  + (-gamma <= phi && phi <= 0)
+    * ((1.0 - weak) * (0.5 - phi/gamma - 0.5*phi^2/gamma^2) + weak)
+  + (phi < -gamma) * 1.0
+) //
+
+macro Hprime(phi)
+(
+    (0 < phi && phi <= gamma)
+    * ((1.0 - weak) * (-1.0/gamma + phi/(gamma^2)))
+  + (-gamma <= phi && phi <= 0)
+    * ((1.0 - weak) * (-1.0/gamma - phi/(gamma^2)))
+) //
+
+macro BlackBlock()
+(
+    (x >= 0.9 && x <= 1.0
+  && y >= 0.9 && y <= 1.1
+  && z >= 0.45 && z <= 0.55)
+) //
+
+macro RhoWithBlock(phi)
+(
+    BlackBlock * 1.0
+  + (1.0 - BlackBlock) * HeaviSide(phi)
+) //
+
+macro RhoMassWithBlock(phi)
+(
+    BlackBlock * blockMass
+  + (1.0 - BlackBlock)
+    * (
+          (phi > gamma) * weakM
+        + (0 < phi && phi <= gamma)
+          * ((1.0 - weakM) * (0.5 - phi/gamma + 0.5*phi^2/gamma^2) + weakM)
+        + (-gamma <= phi && phi <= 0)
+          * ((1.0 - weakM) * (0.5 - phi/gamma - 0.5*phi^2/gamma^2) + weakM)
+        + (phi < -gamma) * 1.0
+      )
+) //
+
+macro grad(u) [dx(u), dy(u), dz(u)] //
+
+macro epsilon(ux, uy, uz)
+[
+    dx(ux),
+    dy(uy),
+    dz(uz),
+    (dy(ux) + dx(uy))/sqrt(2.0),
+    (dz(ux) + dx(uz))/sqrt(2.0),
+    (dz(uy) + dy(uz))/sqrt(2.0)
+] //
+
+macro Grad(ux, uy, uz)
+[
+    dx(ux), dy(ux), dz(ux),
+    dx(uy), dy(uy), dz(uy),
+    dx(uz), dy(uz), dz(uz)
+] //
+
+macro div(ux, uy, uz) (dx(ux) + dy(uy) + dz(uz)) //
+
+macro gradRhoDesign(phi)
+(
+    (1.0 - BlackBlock) * Hprime(phi) * grad(phi)
+) //
+
+real epsLabel = 1e-8;
+
+func Labelfunc =
+      (x < epsLabel) ? 2
+    : ((x > 1.0 - epsLabel
+        && y >= 0.9 && y <= 1.1
+        && z >= 0.45 && z <= 0.55) ? 3
+    : ((x > 1.0 - epsLabel) ? 11
+    : (((y < epsLabel) || (y > 2.0 - epsLabel)) ? 12
+    : (((z < epsLabel) || (z > 1.0 - epsLabel)) ? 13 : 14))));
+
+real meshEdgeTarget = 0.64 * hMeshTarget;
+int surfNx = max(2, int(ceil(1.0 / meshEdgeTarget)));
+int surfNy = max(2, int(ceil(2.0 / meshEdgeTarget)));
+int surfNz = max(2, int(ceil(1.0 / meshEdgeTarget)));
+
+mesh FaceXY = square(surfNx, surfNy, [x, 2.0*y]);
+mesh FaceXZ = square(surfNx, surfNz, [x, y]);
+mesh FaceYZ = square(surfNy, surfNz, [2.0*x, y]);
+
+meshS SurfZ0 = movemesh23(FaceXY, transfo = [x, y, 0.0], orientation = -1);
+meshS SurfZ1 = movemesh23(FaceXY, transfo = [x, y, 1.0], orientation = 1);
+meshS SurfY0 = movemesh23(FaceXZ, transfo = [x, 0.0, y], orientation = 1);
+meshS SurfY1 = movemesh23(FaceXZ, transfo = [x, 2.0, y], orientation = -1);
+meshS SurfX0 = movemesh23(FaceYZ, transfo = [0.0, x, y], orientation = -1);
+meshS SurfX1 = movemesh23(FaceYZ, transfo = [1.0, x, y], orientation = 1);
+
+meshS BoxSurf = SurfZ0 + SurfZ1 + SurfY0 + SurfY1 + SurfX0 + SurfX1;
+BoxSurf = change(BoxSurf, rmInternalEdges = true);
+
+real tetVolume = meshEdgeTarget^3 / 6.0;
+real[int] tetRegion = [0.5, 1.0, 0.5, 1, tetVolume];
+mesh3 ThRaw = tetg(BoxSurf, switch = "pqaAAYYQ", nbofregions = 1, regionlist = tetRegion);
+mesh3 Th = change(ThRaw, flabel = Labelfunc);
+
+fespace Uh(Th, [P1, P1, P1]);
+fespace Thetah(Th, [P1, P1, P1]);
+fespace P1h(Th, P1);
+fespace Phih(Th, P1dc);
+
+P1h h1 = hTriangle;
+object << "maximal size of a mesh tetrahedron h = " << h1[].max << endl;
+object << "minimal size of a mesh tetrahedron h = " << h1[].min << endl;
+cout << "maximal size of a mesh tetrahedron h = " << h1[].max << endl;
+cout << "minimal size of a mesh tetrahedron h = " << h1[].min << endl;
+
+P1h phiHole = -1.0;
+real holeRx = 0.095;
+real holeRy = 0.145;
+
+for (int j = 0; j < 6; j++)
+{
+    real holeYC = 0.4*j;
+
+    phiHole = max(phiHole,
+                  1.0 - sqrt(((x - 0.0)/holeRx)^2
+                             + ((y - holeYC)/holeRy)^2));
+
+    phiHole = max(phiHole,
+                  1.0 - sqrt(((x - 1.0)/holeRx)^2
+                             + ((y - holeYC)/holeRy)^2));
+}
+
+for (int j = 0; j < 5; j++)
+{
+    real holeYC = 0.2 + 0.4*j;
+
+    phiHole = max(phiHole,
+                  1.0 - sqrt(((x - 0.5)/holeRx)^2
+                             + ((y - holeYC)/holeRy)^2));
+}
+
+P1h phiInit;
+distance(Th, phiHole, phiInit[]);
+
+Phih phi, Rho, RhoMass;
+phi = phiInit;
+
+real domainVolume = int3d(Th)(1.0);
+real targetInitialVolume = initialVolumeRatio * domainVolume;
+real initialPhiShiftLow = -2.0;
+real initialPhiShiftHigh = 2.0;
+real initialPhiShift = 0.0;
+real initialCalibratedVolume = 0.0;
+
+for (int k = 0; k < 50; k++)
+{
+    initialPhiShift = 0.5 * (initialPhiShiftLow + initialPhiShiftHigh);
+    phi = phiInit + initialPhiShift;
+    Rho = RhoWithBlock(phi);
+    initialCalibratedVolume = int3d(Th)(Rho);
+
+    if (initialCalibratedVolume > targetInitialVolume)
+    {
+        initialPhiShiftLow = initialPhiShift;
+    }
+    else
+    {
+        initialPhiShiftHigh = initialPhiShift;
+    }
+}
+
+initialPhiShift = 0.5 * (initialPhiShiftLow + initialPhiShiftHigh);
+phi = phiInit + initialPhiShift;
+Rho = RhoWithBlock(phi);
+RhoMass = RhoMassWithBlock(phi);
+
+initialCalibratedVolume = int3d(Th)(Rho);
+cout << "Initial volume target = " << targetInitialVolume << endl;
+cout << "Initial volume calibrated = " << initialCalibratedVolume << endl;
+cout << "Initial phi shift = " << initialPhiShift << endl;
+object << "Initial volume target = " << targetInitialVolume << endl;
+object << "Initial volume calibrated = " << initialCalibratedVolume << endl;
+object << "Initial phi shift = " << initialPhiShift << endl;
+
+savevtk("./figure/Rho0_3D.vtu", Th, Rho);
+savevtk("./figure/phi0_3D.vtu", Th, phi);
+
+Uh [modeX, modeY, modeZ], [testX, testY, testZ];
+real lambda1, lambda2, lambda3, lambda4;
+real lambda5, lambda6;
+real gap12, gap12Ratio;
+real lastEigenSolveTime = 0.0;
+real lastVelocitySolveTime = 0.0;
+real lastDGSolveTime = 0.0;
+real lastThetaL2Norm = 0.0;
+real lastThetaMaxNorm = 0.0;
+real lastPhiL2Change = 0.0;
+
+varf EigenOP([ux, uy, uz], [vx, vy, vz]) =
+int3d(Th)(
+      Rho *
+      (
+          2.0 * mu * (epsilon(ux, uy, uz)' * epsilon(vx, vy, vz))
+        + lameLambda * div(ux, uy, uz) * div(vx, vy, vz)
+      )
+)
++ on(2, ux = 0, uy = 0, uz = 0);
+
+varf Mass([ux, uy, uz], [vx, vy, vz]) =
+int3d(Th)(RhoMass * (ux * vx + uy * vy + uz * vz))
++ on(2, ux = 0, uy = 0, uz = 0);
+
+int showeigsize = 1;
+macro SolveFirstEigen(modeX, modeY, modeZ, lambda1)
+{
+    real eigenClockStart = clock();
+    matrix OPm = EigenOP(Uh, Uh, tgv = 1e30);
+    matrix Mm = Mass(Uh, Uh, tgv = 1.0);
+    set(OPm, solver = sparsesolver);
+
+    if (showeigsize == 1)
+    {
+        cout << "EigenOP matrix size = " << OPm.n << " x " << OPm.m << endl;
+        object << "EigenOP matrix size = " << OPm.n << " x " << OPm.m << endl;
+        showeigsize = 0;
+    }
+
+    real[int] eigVal(nev);
+    Uh[int] [eigX, eigY, eigZ](nev);
+
+    int nconv = EigenValue(OPm, Mm,
+                           sym = true,
+                           sigma = sigma,
+                           value = eigVal,
+                           vector = eigX,
+                           tol = 1e-9,
+                           maxit = 0,
+                           ncv = 0);
+
+    if (nconv < 1)
+    {
+        cout << "EigenValue failed: no converged eigenvalue." << endl;
+        exit(1);
+    }
+
+    int eigCount = min(nconv, nev);
+
+    lambda1 = eigVal[0];
+    lambda2 = 0.0;
+    lambda3 = 0.0;
+    lambda4 = 0.0;
+    lambda5 = 0.0;
+    lambda6 = 0.0;
+    gap12 = 1e30;
+    gap12Ratio = 1e30;
+
+    real denomGap = abs(lambda1);
+    if (denomGap < 1e-30)
+    {
+        denomGap = 1e-30;
+    }
+    if (eigCount > 1)
+    {
+        lambda2 = eigVal[1];
+        gap12 = lambda2 - lambda1;
+        gap12Ratio = gap12 / denomGap;
+    }
+    if (eigCount > 2)
+    {
+        lambda3 = eigVal[2];
+    }
+    if (eigCount > 3)
+    {
+        lambda4 = eigVal[3];
+    }
+    if (eigCount > 4)
+    {
+        lambda5 = eigVal[4];
+    }
+    if (eigCount > 5)
+    {
+        lambda6 = eigVal[5];
+    }
+
+    cout << "Eigenvalues: lambda1 = " << lambda1
+         << ", lambda2 = " << lambda2
+         << ", lambda3 = " << lambda3
+         << ", lambda4 = " << lambda4
+         << ", lambda5 = " << lambda5
+         << ", lambda6 = " << lambda6 << endl;
+    cout << "converged eigenpairs used = " << eigCount << endl;
+    cout << "gap12 = " << gap12
+         << ", gap12/lambda1 = " << gap12Ratio << endl;
+
+    object << "Eigenvalues: lambda1 = " << lambda1
+           << ", lambda2 = " << lambda2
+           << ", lambda3 = " << lambda3
+           << ", lambda4 = " << lambda4
+           << ", lambda5 = " << lambda5
+           << ", lambda6 = " << lambda6 << endl;
+    object << "converged eigenpairs used = " << eigCount << endl;
+    object << "gap12 = " << gap12
+           << ", gap12/lambda1 = " << gap12Ratio << endl;
+
+    if ((nconv > 1) && (gap12Ratio < modeGapTol))
+    {
+        cout << "Warning: possible mode switching or nearly multiple first eigenvalue." << endl;
+        object << "Warning: possible mode switching or nearly multiple first eigenvalue." << endl;
+    }
+
+    modeX[] = eigX[0][];
+
+    real massNorm = sqrt(int3d(Th)(RhoMass * (modeX^2 + modeY^2 + modeZ^2)));
+    if (massNorm > 1e-30)
+    {
+        modeX[] = modeX[] / massNorm;
+    }
+
+    lastEigenSolveTime = clock() - eigenClockStart;
+    cout << "EigenOP Success!" << endl;
+    cout << "Eigen solve time = " << lastEigenSolveTime << " s" << endl;
+    object << "Eigen solve time = " << lastEigenSolveTime << " s" << endl;
+} //
+
+Thetah [thetax, thetay, thetaz], [Wx, Wy, Wz];
+
+varf VelocityA([thetax, thetay, thetaz], [Wx, Wy, Wz]) =
+int3d(Th)(
+        Grad(thetax, thetay, thetaz)' * Grad(Wx, Wy, Wz)
+      + [thetax, thetay, thetaz]' * [Wx, Wy, Wz]
+)
++ on(2, thetax = 0)
++ on(3, thetax = 0, thetay = 0, thetaz = 0)
++ on(11, thetax = 0)
++ on(12, thetay = 0)
++ on(13, thetaz = 0);
+
+matrix Atheta = VelocityA(Thetah, Thetah);
+set(Atheta, solver = sparsesolver);
+
+cout << "Velocity matrix size = " << Atheta.n << " x " << Atheta.m << endl;
+object << "Velocity matrix size = " << Atheta.n << " x " << Atheta.m << endl;
+
+macro VelocityPDE(thetax, thetay, thetaz, modex, modey, modez, lambdaone, phiLS)
+{
+    real velocityClockStart = clock();
+    varf Velocityc([thetax, thetay, thetaz], [Wx, Wy, Wz]) =
+    int3d(Th)(
+        [Wx, Wy, Wz]' * gradRhoDesign(phiLS)
+    )
+    + on(2, thetax = 0)
+    + on(3, thetax = 0, thetay = 0, thetaz = 0)
+    + on(11, thetax = 0)
+    + on(12, thetay = 0)
+    + on(13, thetaz = 0);
+
+    varf Velocityb([thetax, thetay, thetaz], [Wx, Wy, Wz]) =
+    - int3d(Th)(
+        (
+            2.0 * mu * (epsilon(modex, modey, modez)' * epsilon(modex, modey, modez))
+          + lameLambda * div(modex, modey, modez) * div(modex, modey, modez)
+          - lambdaone * (1.0 - weakM) / (1.0 - weak) * (modex^2 + modey^2 + modez^2)
+        )
+        * ([Wx, Wy, Wz]' * gradRhoDesign(phiLS))
+    )
+    + on(2, thetax = 0)
+    + on(3, thetax = 0, thetay = 0, thetaz = 0)
+    + on(11, thetax = 0)
+    + on(12, thetay = 0)
+    + on(13, thetaz = 0);
+
+    real[int] cRho = Velocityc(0, Thetah);
+    real[int] bRho = Velocityb(0, Thetah);
+
+    real[int] zRho = Atheta^-1 * bRho;
+    real[int] yRho = Atheta^-1 * cRho;
+
+    real cy = cRho' * yRho;
+    real cz = cRho' * zRho;
+    real ptheta = 0.0;
+
+    if (abs(cy) > 1e-30)
+    {
+        ptheta = cz / cy;
+    }
+
+    real[int] thetaSol = zRho - ptheta * yRho;
+
+    thetax[] = thetaSol;
+    lastVelocitySolveTime = clock() - velocityClockStart;
+    cout << "Velocity Success!" << endl;
+    cout << "Velocity solve time = " << lastVelocitySolveTime << " s" << endl;
+    object << "Velocity solve time = " << lastVelocitySolveTime << " s" << endl;
+} //
+
+macro GetVol(Rho)
+(
+    int3d(Th)(Rho)
+) //
+
+macro GetdVol(thetax, thetay, thetaz, phiLS)
+(
+    int3d(Th)([thetax, thetay, thetaz]' * gradRhoDesign(phiLS))
+) //
+
+macro GetdLambda(modeX, modeY, modeZ, thetax, thetay, thetaz, lambda1, phiLS)
+(
+    - int3d(Th)(
+        (
+            2.0 * mu * (epsilon(modeX, modeY, modeZ)' * epsilon(modeX, modeY, modeZ))
+          + lameLambda * div(modeX, modeY, modeZ) * div(modeX, modeY, modeZ)
+          - lambda1 * (1.0 - weakM) / (1.0 - weak) * (modeX^2 + modeY^2 + modeZ^2)
+        )
+        * ([thetax, thetay, thetaz]' * gradRhoDesign(phiLS))
+      )
+) //
+
+macro NormalTheta(thetax, thetay, thetaz)
+(
+    N.x * thetax + N.y * thetay + N.z * thetaz
+) //
+
+macro ThetaL2Norm(thetax, thetay, thetaz)
+(
+    sqrt(int3d(Th)(thetax^2 + thetay^2 + thetaz^2))
+) //
+
+macro UpdateThetaStats(thetax, thetay, thetaz)
+{
+    P1h thetaAbs;
+    thetaAbs = sqrt(thetax^2 + thetay^2 + thetaz^2);
+    lastThetaL2Norm = ThetaL2Norm(thetax, thetay, thetaz);
+    lastThetaMaxNorm = thetaAbs[].max;
+} //
+
+macro UpdateTiter(iter, thetax, thetay, thetaz)
+{
+    UpdateThetaStats(thetax, thetay, thetaz);
+    if (TStrategy == 1)
+    {
+        Titer = T0;
+    }
+    else if (TStrategy == 2)
+    {
+        int halveCount = iter / TDecayPeriod;
+        Titer = T0 / (2.0^halveCount);
+    }
+    else if (TStrategy == 3)
+    {
+        if (lastThetaMaxNorm > 1e-30)
+        {
+            Titer = min(T0, TScale * hMeshTarget / lastThetaMaxNorm);
+        }
+        else
+        {
+            Titer = T0;
+        }
+    }
+    cout << "theta L2 norm = " << lastThetaL2Norm << endl;
+    cout << "theta max norm = " << lastThetaMaxNorm << endl;
+    cout << "T*max|theta|/h = " << Titer * lastThetaMaxNorm / hMeshTarget << endl;
+    object << "theta L2 norm = " << lastThetaL2Norm << endl;
+    object << "theta max norm = " << lastThetaMaxNorm << endl;
+    object << "T*max|theta|/h = " << Titer * lastThetaMaxNorm / hMeshTarget << endl;
+} //
+
+macro LFDG(phiOutput, phiInput, thetax, thetay, thetaz, Tsum)
+{
+    real dgClockStart = clock();
+    real t = 0.0;
+    real dt = Tsum / 5.0;
+
+    Phih u, v, phiBefore;
+    phiBefore = phiInput;
+
+    varf Adual(u, v) =
+    int3d(Th)((u / dt + ([thetax, thetay, thetaz]' * grad(u))) * v)
+    - intallfaces(Th)(
+          (nElementonB - 1.0) * v
+        * (0.5 * abs(NormalTheta(thetax, thetay, thetaz))
+           - NormalTheta(thetax, thetay, thetaz) / 2.0)
+        * jump(u)
+      );
+
+    varf DGRHS(u, v) = int3d(Th)((u / dt) * v);
+
+    matrix Bm = DGRHS(Phih, Phih);
+    matrix Am;
+    if (DGSolverMode == 0)
+    {
+        Am = Adual(Phih, Phih, solver = sparsesolver);
+    }
+    else
+    {
+        Am = Adual(Phih, Phih, solver = GMRES, eps = 1e-8, nbiter = 500);
+    }
+    for (t = 0.0; t < Tsum; t += dt)
+    {
+        v[] = Bm * phiInput[];
+        phiOutput[] = Am^-1 * v[];
+        phiInput = phiOutput;
+    }
+
+    lastDGSolveTime = clock() - dgClockStart;
+    lastPhiL2Change = sqrt(int3d(Th)((phiOutput - phiBefore)^2));
+    cout << "DG Success!" << endl;
+    cout << "DG solve time = " << lastDGSolveTime << " s" << endl;
+    cout << "Phi L2 change = " << lastPhiL2Change << endl;
+    object << "DG solve time = " << lastDGSolveTime << " s" << endl;
+    object << "Phi L2 change = " << lastPhiL2Change << endl;
+} //
+
+macro RedistanceConvert(phiInput)
+{
+    P1h phiRe;
+    distance(Th, phiInput, phiRe[]);
+    phiInput = phiRe;
+} //
+
+macro OutPutData(i, eigValue, vol, dvol, dlambda, obj)
+{
+    if (i == 0)
+    {
+        obj << "Initial condition" << endl;
+        obj << "lambda1 = " << eigValue[i] << endl;
+        obj << "lambda2 = " << lambda2 << endl;
+        obj << "gap12/lambda1 = " << gap12Ratio << endl;
+        obj << "Vol = " << vol[i] << endl;
+    }
+    else
+    {
+        obj << i << "-th iteration" << endl;
+        obj << "lambda1 = " << eigValue[i]
+            << ";   diff = " << eigValue[i] - eigValue[i-1] << endl;
+        obj << "Vol = " << vol[i]
+            << ";   diff from initial = " << vol[i] - vol[0]
+            << ";   step diff = " << vol[i] - vol[i-1] << endl;
+        obj << "dVol(theta) = " << dvol << endl;
+        obj << "dLambda(theta) = " << dlambda << endl;
+        obj << "lambda2 = " << lambda2 << endl;
+        obj << "gap12/lambda1 = " << gap12Ratio << endl;
+    }
+    obj.flush;
+} //
+
+Phih phitest;
+real[int] EigenValue1(iterMax + 1);
+real[int] EigenValue2(iterMax + 1);
+real[int] EigenValue3(iterMax + 1);
+real[int] EigenValue4(iterMax + 1);
+real[int] EigenValue5(iterMax + 1);
+real[int] EigenValue6(iterMax + 1);
+real[int] Gap12Ratio(iterMax + 1);
+real[int] Vol(iterMax + 1);
+real dVolTheta, dLambdaTheta;
+
+int iter = 0;
+
+SolveFirstEigen(modeX, modeY, modeZ, lambda1);
+VelocityPDE(thetax, thetay, thetaz, modeX, modeY, modeZ, lambda1, phi);
+
+EigenValue1[iter] = lambda1;
+EigenValue2[iter] = lambda2;
+EigenValue3[iter] = lambda3;
+EigenValue4[iter] = lambda4;
+EigenValue5[iter] = lambda5;
+EigenValue6[iter] = lambda6;
+Gap12Ratio[iter] = gap12Ratio;
+Vol[iter] = GetVol(Rho);
+dVolTheta = GetdVol(thetax, thetay, thetaz, phi);
+dLambdaTheta = GetdLambda(modeX, modeY, modeZ,
+                           thetax, thetay, thetaz,
+                           lambda1, phi);
+OutPutData(iter, EigenValue1, Vol, dVolTheta, dLambdaTheta, object);
+/*
+plot(Rho, fill = 1, value = 1, cmm = "Rho_"+iter, wait = false);
+*/
+
+real tstart;
+real tend;
+real tcost;
+real tsum = 0.0;
+
+while (iter < iterMax)
+{
+    tstart = clock();
+    cout << endl;
+    cout << "Iter = " << iter << ", lambda1 = " << lambda1 << endl;
+    object << endl << "Iter = " << iter << endl;
+
+    UpdateTiter(iter, thetax, thetay, thetaz);
+    phitest = phi;
+    LFDG(phi, phitest, thetax, thetay, thetaz, Titer);
+
+    if ((RedistancePeriod > 0) && ((iter + 1) % RedistancePeriod == 0))
+    {
+        RedistanceConvert(phi);
+        cout << "Redistance End!" << endl;
+    }
+
+    Rho = RhoWithBlock(phi);
+    RhoMass = RhoMassWithBlock(phi);
+
+    SolveFirstEigen(modeX, modeY, modeZ, lambda1);
+    VelocityPDE(thetax, thetay, thetaz, modeX, modeY, modeZ, lambda1, phi);
+
+    iter = iter + 1;
+
+    EigenValue1[iter] = lambda1;
+    EigenValue2[iter] = lambda2;
+    EigenValue3[iter] = lambda3;
+    EigenValue4[iter] = lambda4;
+    EigenValue5[iter] = lambda5;
+    EigenValue6[iter] = lambda6;
+    Gap12Ratio[iter] = gap12Ratio;
+    Vol[iter] = GetVol(Rho);
+    dVolTheta = GetdVol(thetax, thetay, thetaz, phi);
+    dLambdaTheta = GetdLambda(modeX, modeY, modeZ,
+                               thetax, thetay, thetaz,
+                               lambda1, phi);
+
+    cout << "Titer = " << Titer << endl;
+    object << "Titer = " << Titer << endl;
+    OutPutData(iter, EigenValue1, Vol, dVolTheta, dLambdaTheta, object);
+
+    /*
+    plot(Rho, fill = 1, value = 1, cmm = "Rho_"+iter, wait = false);
+    */
+    if (iter % 10 == 0)
+    {
+        string filename = "./figure/Rho3D_" + iter + ".vtu";
+        savevtk(filename, Th, Rho);
+
+        string filenamePhi = "./figure/Phi3D_" + iter + ".vtu";
+        savevtk(filenamePhi, Th, phi);
+    }
+
+    tend = clock();
+    tcost = tend - tstart;
+    tsum = tsum + tcost;
+    cout << "Iteration time = " << tcost << " s" << endl;
+    object << "Iteration time = " << tcost << " s" << endl;
+    object.flush;
+}
+
+cout << "Iteration sum time = " << tsum << " s" << endl;
+object << "Iteration sum time = " << tsum << " s" << endl;
+object.flush;
+
+ofstream OutMatlab(ModelMatlabName);
+OutMatlab << "Num = " << iter + 1 << endl;
+for (int i = 0; i <= iter; i++)
+{
+    OutMatlab << "Volume(" << i+1 << ") = " << Vol[i] << "; ";
+    OutMatlab << "lambda1(" << i+1 << ") = " << EigenValue1[i] << "; ";
+    OutMatlab << "lambda2(" << i+1 << ") = " << EigenValue2[i] << "; ";
+    OutMatlab << "lambda3(" << i+1 << ") = " << EigenValue3[i] << "; ";
+    OutMatlab << "lambda4(" << i+1 << ") = " << EigenValue4[i] << "; ";
+    OutMatlab << "lambda5(" << i+1 << ") = " << EigenValue5[i] << "; ";
+    OutMatlab << "lambda6(" << i+1 << ") = " << EigenValue6[i] << "; ";
+    OutMatlab << "gap12ratio(" << i+1 << ") = " << Gap12Ratio[i] << ";" << endl;
+}
+

@@ -1,0 +1,381 @@
+load "distance"
+load "iovtk"
+verbosity = 0;
+
+// ==============================
+// 参数设置
+// ==============================
+real Titer = 0.075;
+int iterMax = 300;
+
+// 线弹性 Lamé 常数
+real mu = 8.0;
+real lameLambda = 1.0;
+
+// 弱材料密度，避免刚度矩阵和质量矩阵奇异
+real weak = 1e-4;
+
+// 光滑 Heaviside 函数的界面宽度
+real gamma = 0.005;
+
+// 计算靠近 sigmaEV 的特征值；取 0 表示计算最小正特征值
+real sigmaEV = 0.0;
+int nev = 4;
+
+ofstream object("./Output/MainEigen.obj");
+string ModelMatLabName = "matlab/Model1_EigenShape1.m";
+
+// ==============================
+// 水平集密度函数
+// ==============================
+// rho = H_{gamma,weak}(phi)，其中 phi < 0 表示材料区域，phi > 0 表示弱材料区域。
+// 该函数同时用于弹性刚度矩阵和质量矩阵。
+macro HeaviSide(phi)
+(
+    (phi > gamma) * weak +
+    (0 < phi && phi <= gamma) *
+    ((1.0 - weak) * (0.5 - phi/gamma + 0.5*phi^2/gamma^2) + weak) +
+    (-gamma <= phi && phi <= 0) *
+    ((1.0 - weak) * (0.5 - phi/gamma - 0.5*phi^2/gamma^2) + weak) +
+    (phi < -gamma) * 1.0
+)
+
+// 线弹性应变张量的 Voigt 形式。
+macro epsilon(ux, uy) [dx(ux), dy(uy), (dy(ux) + dx(uy))/sqrt(2.0)] //
+macro grad(u) [dx(u), dy(u)] //
+macro Grad(ux, uy) [dx(ux), dy(ux), dx(uy), dy(uy)] //
+macro div(ux, uy) (dx(ux) + dy(uy)) //
+
+// ==============================
+// 网格与有限元空间
+// ==============================
+// 边界 label=2 为弹性位移的 Dirichlet 固定边界。
+// 速度场边界条件用于控制界面不从外边界流出，并保持形状更新稳定。
+border bdrightN1(t = -0.5, -0.05) { x=1;  y=t; label=11; };
+border bdrightNN(t = -0.05, 0.05) { x=1;  y=t; label=3;  };
+border bdrightN2(t = 0.05, 0.5)   { x=1;  y=t; label=11; };
+border bdleftD(t = 0.5, -0.5)     { x=-1; y=t; label=2;  };
+border bdupN(t = 1, -1)           { x=t;  y=0.5; label=12; };
+border bdbottomN(t = -1, 1)       { x=t;  y=-0.5; label=12; };
+
+int n = 4;
+mesh Th = buildmesh(
+      bdrightN1(9*n) + bdrightNN(3*n) + bdrightN2(9*n)
+    + bdleftD(20*n) + bdupN(40*n) + bdbottomN(40*n)
+);
+
+savevtk("./figure/Th1_1.vtu", Th);
+
+// Uh 存放弹性特征振型，Thetah 存放水平集速度场。
+// P1h 专门用于 distance 重新初始化的输出；Phih 用于 DG 水平集函数。
+fespace Uh(Th, [P2, P2]);
+fespace Thetah(Th, [P2, P2]);
+fespace P1h(Th, P1);
+fespace Phih(Th, P1dc);
+
+P1h h1 = hTriangle;
+object << "maximal size of a mesh triangle h = " << h1[].max << endl;
+object << "minimal size of a mesh triangle h = " << h1[].min << endl;
+
+// ==============================
+// 初始水平集函数
+// ==============================
+// 初始材料区域由若干圆形区域的并集给出，phi < 0 为材料区域。
+macro R1() (0.2 - sqrt((abs(x))^2 + (abs(y) - 0.5)^2)) //
+macro R2() (0.2 - sqrt((abs(x) - 0.6)^2 + (abs(y) - 0.5)^2)) //
+macro R3() (0.1 - sqrt((abs(x) - 0.3)^2 + (abs(y) - 0.25)^2)) //
+macro R4() (0.1 - sqrt((abs(x) - 1.0)^2 + (abs(y) - 0.25)^2)) //
+macro R5() (0.2 - sqrt((abs(x))^2 + (abs(y))^2)) //
+macro R6() (0.2 - sqrt((abs(x) - 0.6)^2 + (abs(y))^2)) //
+
+func phi0 = (R1 >= 0) * R1
+          + (R2 >= 0) * R2
+          + (R3 >= 0) * R3
+          + (R4 >= 0) * R4
+          + (R5 >= 0) * R5
+          + (R6 >= 0) * R6
+          + (R1 < 0 && R2 < 0 && R3 < 0 && R4 < 0 && R5 < 0 && R6 < 0)
+            * max(R1, max(R2, max(R3, max(R4, max(R5, R6)))));
+
+// distance 可以接受一般有限元函数或 func 表达式作为输入，但输出数组必须属于 P1h。
+P1h phiInit;
+distance(Th, phi0, phiInit[]);
+
+Phih phi, Rho;
+phi = phiInit;
+Rho = HeaviSide(phi);
+
+plot(Rho, fill = 1, value = 1, cmm = "Rho_0", wait = false);
+savevtk("./figure/Rho_0.vtu", Th, Rho);
+savevtk("./figure/phi_0.vtu", Th, phi);
+
+// ==============================
+// 弹性结构广义特征值问题
+// ==============================
+// 给定 rho，求第一特征对：
+//    K(rho) u = lambda M(rho) u,
+// 其中 K 来自线弹性应变能，M 来自 rho 加权的质量型双线性型。
+Uh [modeX, modeY], [testX, testY];
+real lambda1;
+
+varf EigenOP([ux, uy], [vx, vy]) =
+int2d(Th)(
+      Rho * (
+          2.0 * mu * (epsilon(ux, uy)' * epsilon(vx, vy))
+        + lameLambda * div(ux, uy) * div(vx, vy)
+      )
+    - sigmaEV * Rho * (ux * vx + uy * vy)
+)
++ on(2, ux = 0, uy = 0);
+
+varf Mass([ux, uy], [vx, vy]) =
+int2d(Th)(Rho * (ux * vx + uy * vy));
+
+macro SolveFirstEigen(modeX, modeY, lambda1)
+{
+    matrix OPm = EigenOP(Uh, Uh, solver = Crout, factorize = 1);
+    matrix Mm  = Mass(Uh, Uh, solver = CG, eps = 1e-20);
+
+    real[int] eigVal(nev);
+    Uh[int] [eigX, eigY](nev);
+
+    int nconv = EigenValue(OPm, Mm,
+                           sym = true,
+                           sigma = sigmaEV,
+                           value = eigVal,
+                           vector = eigX,
+                           tol = 1e-9,
+                           maxit = 0,
+                           ncv = 0);
+
+    if (nconv < 1)
+    {
+        cout << "EigenValue failed: no converged eigenvalue." << endl;
+        exit(1);
+    }
+
+    lambda1 = eigVal[0];
+    modeX = eigX[0];
+    modeY = eigY[0];
+
+    real massNorm = sqrt(int2d(Th)(Rho * (modeX^2 + modeY^2)));
+    modeX[] = modeX[] / massNorm;
+} //
+
+// ==============================
+// 保体积速度场
+// ==============================
+// 对 J = -lambda1 做下降，相当于对 lambda1 做上升。
+// 若 m_rho(u,u)=1，则第一简单特征值满足
+// d lambda1 = - int_D S(u,lambda1) theta · grad(rho) dx，
+// 其中 S = 2 mu epsilon(u):epsilon(u) + lambda div(u)^2 - lambda1 |u|^2。
+// 因此 dJ = int_D S theta · grad(rho) dx。
+// 速度场通过约束 Riesz 表示得到，并满足 int_D theta · grad(rho) dx = 0。
+Thetah [thetax, thetay], [Wx, Wy];
+
+varf VelocityA([thetax, thetay], [Wx, Wy]) =
+int2d(Th)(
+      Grad(thetax, thetay)' * Grad(Wx, Wy)
+    + [thetax, thetay]' * [Wx, Wy]
+)
++ on(3, thetax = 0, thetay = 0)
++ on(11, 2, thetax = 0)
++ on(12, thetay = 0);
+
+matrix Atheta = VelocityA(Thetah, Thetah);
+
+macro VelocityPDE(thetax, thetay, modeX, modeY, lambda1, Rho)
+{
+    varf VelocitycRho([thetax, thetay], [Wx, Wy]) =
+    int2d(Th)([Wx, Wy]' * grad(Rho))
+    + on(3, thetax = 0, thetay = 0)
+    + on(11, 2, thetax = 0)
+    + on(12, thetay = 0);
+
+    varf VelocitybRho([thetax, thetay], [Wx, Wy]) =
+    - int2d(Th)(
+        (
+            2.0 * mu * (epsilon(modeX, modeY)' * epsilon(modeX, modeY))
+          + lameLambda * div(modeX, modeY) * div(modeX, modeY)
+          - lambda1 * (modeX^2 + modeY^2)
+        )
+        * ([Wx, Wy]' * grad(Rho))
+      )
+    + on(3, thetax = 0, thetay = 0)
+    + on(11, 2, thetax = 0)
+    + on(12, thetay = 0);
+
+    real[int] cRho = VelocitycRho(0, Thetah);
+    real[int] bRho = VelocitybRho(0, Thetah);
+
+    matrix LHSm = [[Atheta, cRho], [cRho', 0]];
+    real[int] RHS = [bRho, 0];
+
+    set(LHSm, solver = sparsesolver);
+    real[int] sol = LHSm^-1 * RHS;
+
+    int nTheta = thetax[].n;
+    thetax[] = sol(0:nTheta-1);
+} //
+
+// ==============================
+// 监测量
+// ==============================
+macro GetVol(Rho)
+(
+    int2d(Th)(Rho)
+) //
+
+macro GetdVol(thetax, thetay, Rho)
+(
+    int2d(Th)([thetax, thetay]' * grad(Rho))
+) //
+
+macro GetdLambda(modeX, modeY, thetax, thetay, lambda1, Rho)
+(
+    - int2d(Th)(
+        (
+            2.0 * mu * (epsilon(modeX, modeY)' * epsilon(modeX, modeY))
+          + lameLambda * div(modeX, modeY) * div(modeX, modeY)
+          - lambda1 * (modeX^2 + modeY^2)
+        )
+        * ([thetax, thetay]' * grad(Rho))
+      )
+) //
+
+// ==============================
+// DG 水平集输运方程
+// ==============================
+// 由速度场 theta 更新水平集函数：phi_t + theta · grad(phi) = 0。
+// 这里使用隐式迎风 DG 格式，phi 属于 P1dc。
+macro nn()
+(
+    N.x * thetax + N.y * thetay
+) //
+
+macro LFDG(phiOutput, phiInput, thetax, thetay, Tsum)
+{
+    real t = 0.0;
+    real dt = Tsum / 5.0;
+
+    Phih u, v;
+
+    varf Adual(u, v) =
+    int2d(Th)((u / dt + ([thetax, thetay]' * grad(u))) * v)
+    - intalledges(Th)(
+          (nTonEdge - 1.0) * v
+        * (0.5 * abs(nn) - nn / 2.0) * jump(u)
+      );
+
+    varf DGRHS(u, v) = int2d(Th)((u / dt) * v);
+
+    matrix Am = Adual(Phih, Phih);
+    matrix Bm = DGRHS(Phih, Phih);
+    set(Am, solver = sparsesolver);
+
+    for (t = 0.0; t < Tsum; t += dt)
+    {
+        v[] = Bm * phiInput[];
+        phiOutput[] = Am^-1 * v[];
+        phiInput = phiOutput;
+    }
+} //
+
+// ==============================
+// distance 重新初始化
+// ==============================
+// distance 的输出必须是 P1h，然后再赋值回 DG 空间。
+macro RedistanceConvert(phiInput)
+{
+    P1h phiRe;
+    distance(Th, phiInput, phiRe[]);
+    phiInput = phiRe;
+} //
+
+// ==============================
+// 输出当前迭代信息
+// ==============================
+macro OutPutData(i, eigValue, vol, dvol, dlambda, obj)
+{
+    if (i == 0)
+    {
+        obj << "Initial condition" << endl;
+        obj << "lambda1 = " << eigValue[i] << endl;
+        obj << "Vol = " << vol[i] << endl;
+    }
+    else
+    {
+        obj << i << "-th iteration" << endl;
+        obj << "lambda1 = " << eigValue[i]
+            << ";   diff = " << eigValue[i] - eigValue[i-1] << endl;
+        obj << "Vol = " << vol[i]
+            << ";   diff = " << vol[i] - vol[0] << endl;
+        obj << "dVol(theta) = " << dvol << endl;
+        obj << "dLambda(theta) = " << dlambda << endl;
+    }
+    obj.flush;
+} //
+
+// ==============================
+// 主迭代
+// ==============================
+Phih phitest;
+real[int] EigenValue1(iterMax + 1);
+real[int] Vol(iterMax + 1);
+real dVolTheta, dLambdaTheta;
+
+int iter = 0;
+
+SolveFirstEigen(modeX, modeY, lambda1);
+VelocityPDE(thetax, thetay, modeX, modeY, lambda1, Rho);
+
+EigenValue1[iter] = lambda1;
+Vol[iter] = GetVol(Rho);
+dVolTheta = GetdVol(thetax, thetay, Rho);
+dLambdaTheta = GetdLambda(modeX, modeY, thetax, thetay, lambda1, Rho);
+OutPutData(iter, EigenValue1, Vol, dVolTheta, dLambdaTheta, object);
+
+while (iter < iterMax)
+{
+    cout << "Iter = " << iter << ", lambda1 = " << lambda1 << endl;
+    object << endl << "Iter = " << iter << endl;
+
+    phitest = phi;
+    LFDG(phi, phitest, thetax, thetay, Titer);
+
+    if ((iter - 1) % 8 == 0)
+    {
+        RedistanceConvert(phi);
+        cout << "Redistance End!" << endl;
+    }
+
+    Rho = HeaviSide(phi);
+
+    SolveFirstEigen(modeX, modeY, lambda1);
+    VelocityPDE(thetax, thetay, modeX, modeY, lambda1, Rho);
+
+    iter++;
+    EigenValue1[iter] = lambda1;
+    Vol[iter] = GetVol(Rho);
+    dVolTheta = GetdVol(thetax, thetay, Rho);
+    dLambdaTheta = GetdLambda(modeX, modeY, thetax, thetay, lambda1, Rho);
+
+    object << "Titer = " << Titer << endl;
+    OutPutData(iter, EigenValue1, Vol, dVolTheta, dLambdaTheta, object);
+
+    plot(Rho, fill = 1, value = 1, cmm = "Rho_" + iter, wait = false);
+
+    string filename = "./figure/Rho_" + iter + ".vtu";
+    savevtk(filename, Th, Rho);
+}
+
+// ==============================
+// Matlab 数据输出
+// ==============================
+ofstream OutMatlab(ModelMatLabName);
+OutMatlab << "Num = " << iter + 1 << endl;
+for (int i = 0; i <= iter; i++)
+{
+    OutMatlab << "Volume(" << i+1 << ") = " << Vol[i] << "; ";
+    OutMatlab << "lambda1(" << i+1 << ") = " << EigenValue1[i] << ";" << endl;
+}

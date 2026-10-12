@@ -1,0 +1,9 @@
+metric,value
+signed_transport_over_V0,-0.0363525297958864
+signed_reinitialization_over_V0,-0.00454790316407353
+signed_total_over_V0,-0.0409004329599599
+absolute_transport_over_V0,0.0789880621536541
+absolute_reinitialization_over_V0,0.00824413819040866
+transport_share_of_absolute_sources,0.90549202980216
+reinitialization_share_of_absolute_sources,0.0945079701978397
+number_of_reinitialization_steps,38

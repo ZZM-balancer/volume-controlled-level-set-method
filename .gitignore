@@ -1,0 +1,22 @@
+# Generated visualization sequences; retain geometry and ordinary input meshes.
+*.vtu
+*.vtk
+
+# Oversized optional mesh; retain its Gmsh geometry definition.
+/GenMesh_3D_Model1/Msh/Th003_002.msh
+
+# FreeFEM text run logs use the .obj suffix in this project.
+*.obj
+*.log
+
+# Temporary refinement-study workspaces.
+.coupled-mesh-*-work/
+.full-step-study-work/
+
+# Local editor, operating-system, and backup files.
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+*.asv
+*~

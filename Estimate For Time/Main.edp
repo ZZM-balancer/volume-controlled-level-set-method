@@ -1,0 +1,403 @@
+load "TetGen"
+load "gmsh"
+load "distance"
+load "iovtk"
+load "PETSc"
+include "getARGV.idp"
+verbosity = 0;
+
+real Titer = getARGV("-Titer", 0.075);
+int iterMax = getARGV("-iterMax", 300);
+real mu = 8.;
+real lambda = 1.;
+real weak = 1.e-4;
+real gamma = getARGV("-gamma", 0.005);
+string ObjectName = getARGV("-object", "./Output/Main.obj");
+string ModelMatLabName = getARGV("-matlab", "matlab/Model1_Shape1.m");
+string TimeDataName = getARGV("-timeData", "./Output/TimeDiagnostics.csv");
+string StepOrderName = getARGV("-stepOrderData", "./Output/StepOrder.csv");
+int writeVisual = getARGV("-writeVisual", 1);
+int silent = getARGV("-silent", 0);
+int enableShadow = getARGV("-enableShadow", 0);
+int shadowStride = getARGV("-shadowStride", 10);
+int shadowLevels = getARGV("-shadowLevels", 4);
+int meshScale = getARGV("-meshScale", 4);
+assert(shadowStride >= 1);
+assert(shadowLevels >= 2);
+assert(gamma > 0.);
+assert(meshScale >= 1);
+ofstream object(ObjectName);
+
+macro HeaviSide(phi) (
+    (phi > gamma) * weak
+    + (0 < phi && phi <= gamma)
+      * ((1.-weak) * (0.5-phi/gamma+0.5*phi^2/gamma^2) + weak)
+    + (-gamma <= phi && phi <= 0)
+      * ((1.-weak) * (0.5-phi/gamma-0.5*phi^2/gamma^2) + weak)
+    + (phi < -gamma) * 1.
+) //
+
+macro sign(x) ((x >= 0) * 1. + (x < 0) * (-1.)) //
+macro epsilon(ux, uy) [dx(ux), dy(uy), (dy(ux)+dx(uy))/sqrt(2)] //
+macro grad(u) [dx(u), dy(u)] //
+macro Grad(ux, uy) [dx(ux), dy(ux), dx(uy), dy(uy)] //
+macro div(ux, uy) (dx(ux) + dy(uy)) //
+
+border bdrightN1(t=-0.5, -0.05) { x=1.; y=t; label=11; }
+border bdrightNN(t=-0.05, 0.05) { x=1.; y=t; label=3; }
+border bdrightN2(t=0.05, 0.5) { x=1.; y=t; label=11; }
+border bdleftD(t=0.5, -0.5) { x=-1.; y=t; label=2; }
+border bdupN(t=1., -1.) { x=t; y=0.5; label=12; }
+border bdbottomN(t=-1., 1.) { x=t; y=-0.5; label=12; }
+
+int n = meshScale;
+mesh Th = buildmesh(
+    bdrightN1(9*n) + bdrightNN(3*n) + bdrightN2(9*n)
+    + bdleftD(20*n) + bdupN(40*n) + bdbottomN(40*n)
+);
+
+if (writeVisual) savevtk("Th1_1.vtu", Th);
+
+fespace Uh(Th, [P2, P2]);
+fespace Thetah(Th, [P2, P2]);
+fespace P1h(Th, P1);
+fespace Phih(Th, P1dc);
+
+P1h h1 = hTriangle;
+real hmax = h1[].max;
+real hmin = h1[].min;
+object << "maximal size of a mesh triangle h = " << hmax << endl;
+object << "minimal size of a mesh triangle h = " << hmin << endl;
+
+macro R1() (0.2-sqrt((abs(x))^2+(abs(y)-0.5)^2)) //
+macro R2() (0.2-sqrt((abs(x)-0.6)^2+(abs(y)-0.5)^2)) //
+macro R3() (0.1-sqrt((abs(x)-0.3)^2+(abs(y)-0.25)^2)) //
+macro R4() (0.1-sqrt((abs(x)-1.)^2+(abs(y)-0.25)^2)) //
+macro R5() (0.2-sqrt((abs(x))^2+(abs(y))^2)) //
+macro R6() (0.2-sqrt((abs(x)-0.6)^2+(abs(y))^2)) //
+
+func phi0 = (R1 >= 0) * R1
+          + (R2 >= 0) * R2
+          + (R3 >= 0) * R3
+          + (R4 >= 0) * R4
+          + (R5 >= 0) * R5
+          + (R6 >= 0) * R6
+          + (R1 < 0 && R2 < 0 && R3 < 0 && R4 < 0 && R5 < 0 && R6 < 0)
+            * max(R1, max(R2, max(R3, max(R4, max(R5, R6)))));
+
+P1h phiInit;
+distance(Th, phi0, phiInit[]);
+
+Phih phi, Rho;
+phi = phi0;
+Rho = HeaviSide(phi);
+if (writeVisual) {
+    plot(Rho, fill=1, value=1, cmm="Rho_0");
+    savevtk("./figure/Rho_0.vtu", Th, Rho);
+    savevtk("./figure/phi_0.vtu", Th, phi);
+}
+
+P1h p, q;
+Uh [ux, uy], [vx, vy];
+func gx = 0.;
+func gy = -5.;
+
+varf Elasticity([ux, uy], [vx, vy]) =
+    int2d(Th)(
+        2.*mu*Rho*(epsilon(ux, uy)'*epsilon(vx, vy))
+        + lambda*Rho*div(ux, uy)*div(vx, vy)
+    )
+    + on(2, ux=0., uy=0.);
+
+varf ElasticityRHS([ux, uy], [vx, vy]) =
+    int1d(Th, 3)(gx*vx+gy*vy)
+    + on(2, ux=0., uy=0.);
+
+real[int] Elasticityb = ElasticityRHS(0, Uh);
+
+macro ElasticityPDE(ux, uy, Rho) {
+    matrix Am = Elasticity(Uh, Uh);
+    Mat A(Am);
+    set(A, sparams="-pc_type lu");
+    real[int] sol = A^-1*Elasticityb;
+    ux[] = sol;
+} //
+
+Thetah [thetax, thetay], [Wx, Wy];
+
+varf VelocityA([thetax, thetay], [Wx, Wy]) =
+    int2d(Th)(
+        Grad(thetax, thetay)'*Grad(Wx, Wy)
+        + [thetax, thetay]'*[Wx, Wy]
+    )
+    + on(3, thetax=0., thetay=0.)
+    + on(11, 2, thetax=0.)
+    + on(12, thetay=0.);
+matrix A2m = VelocityA(Thetah, Thetah);
+
+macro VelocityPDE(thetax, thetay, ux, uy, Rho) {
+    varf VelocitycRho([thetax, thetay], [Wx, Wy]) =
+        int2d(Th)([Wx, Wy]'*grad(Rho))
+        + on(3, thetax=0., thetay=0.)
+        + on(11, 2, thetax=0.)
+        + on(12, thetay=0.);
+
+    varf VelocitybRho([thetax, thetay], [Wx, Wy]) =
+        -int2d(Th)(
+            (2.*mu*epsilon(ux, uy)'*epsilon(ux, uy)
+             + lambda*div(ux, uy)*div(ux, uy))
+            * ([Wx, Wy]'*grad(Rho))
+        )
+        + on(3, thetax=0., thetay=0.)
+        + on(11, 2, thetax=0.)
+        + on(12, thetay=0.);
+
+    real[int] cRho = VelocitycRho(0, Thetah);
+    real[int] bRho = VelocitybRho(0, Thetah);
+    matrix LHSm = [[A2m, cRho], [cRho', 0]];
+    real[int] RHS = [bRho, 0];
+    set(LHSm, solver=CG, eps=1.e-8);
+    Mat LHS(LHSm);
+    set(LHS, sparams="-pc_type lu");
+    real[int] sol(RHS.n);
+    sol = LHS^-1*RHS;
+    thetax[] = sol(0:sol.n-1);
+} //
+
+macro GetCompliance(ux, uy, Rho) (
+    int2d(Th)(
+        2.*mu*Rho*(epsilon(ux, uy)'*epsilon(ux, uy))
+        + lambda*Rho*div(ux, uy)*div(ux, uy)
+    )
+) //
+
+macro GetVol(Rho) (int2d(Th)(Rho)) //
+
+macro GetdJ(ux, uy, thetax, thetay, Rho) (
+    int2d(Th)(
+        (2.*mu*epsilon(ux, uy)'*epsilon(ux, uy)
+         + lambda*div(ux, uy)*div(ux, uy))
+        * ([thetax, thetay]'*grad(Rho))
+    )
+) //
+
+macro GetdV(ux, uy, thetax, thetay, Rho) (
+    int2d(Th)([thetax, thetay]'*grad(Rho))
+) //
+
+// Manuscript form of the discrete volume-compatibility residual.
+// For discontinuous Rho this is not equivalent to GetdV without face terms.
+macro GetdVDivergence(thetax, thetay, Rho) (
+    int2d(Th)(Rho*div(thetax, thetay))
+) //
+
+macro nn() (N.x*thetax+N.y*thetay) //
+
+macro LFDG(phiOutput, phiInput, thetax, thetay, Tsum) {
+    real t = 0.;
+    real dt = Tsum/5.;
+    Phih u, v, phitt, phie;
+    P1h OutRho;
+
+    varf Adual(u, v) =
+        int2d(Th)((u/dt + [thetax, thetay]'*grad(u))*v)
+        - intalledges(Th)(
+            (nTonEdge-1)*v*(0.5*abs(nn)-nn/2.)*jump(u)
+        );
+    varf DGRHS(u, v) = int2d(Th)((u/dt)*v);
+    matrix Bm = DGRHS(Phih, Phih);
+    matrix Am = Adual(Phih, Phih);
+    Mat B(Bm), A(Am);
+
+    for (t=0.; t<Tsum; t+=dt) {
+        v[] = B*phiInput[];
+        phiOutput[] = A^-1*v[];
+        phiInput = phiOutput;
+    }
+} //
+
+macro OutPutData(i, compliance, vol, obj) {
+    if (i == 0) {
+        obj << "Initial Condition: " << endl;
+        obj << "Initial compliance = " << compliance[i] << endl;
+        obj << "Initial Vol = " << vol[i] << endl;
+    } else {
+        obj << i << "-th iteration: " << endl;
+        obj << "Compliance = " << compliance[i]
+            << ";   diff = " << compliance[i]-compliance[i-1] << endl;
+        obj << "Vol = " << vol[i]
+            << ";   diff = " << vol[i]-vol[0] << endl;
+    }
+    obj.flush;
+} //
+
+macro RedistanceConvert(phiInput) {
+    P1h phiRe;
+    distance(Th, phiInput, phiRe[]);
+    phiInput = phiRe;
+} //
+
+Uh [uxnew, uynew];
+Phih phitest, phinew, Rhonew, RhoAfterTransport;
+Phih phiProbeInput, phiProbeTransport, phiProbeStep;
+Phih rhoProbeTransport, rhoProbeStep;
+real[int] compliance(iterMax+1);
+real[int] Vol(iterMax+1);
+real compliancenew, Volnew;
+
+ofstream TimeData(TimeDataName);
+TimeData.precision(16);
+TimeData << "iteration,mesh_scale,hmax,hmin,gamma,"
+         << "pseudo_time_before,pseudo_time_after,T,dt,substeps,"
+         << "volume_before,volume_after_transport,volume_after_step,"
+         << "step_signed_drift,step_abs_drift,step_relative_drift,"
+         << "transport_signed_drift,transport_abs_drift,dVdt_before,dVdt_abs,"
+         << "divergence_constraint_before,divergence_constraint_abs,"
+         << "velocity_component_linf,"
+         << "reinit_signed_jump,reinit_abs_jump,"
+         << "did_reinitialize,compliance_before,compliance_after,"
+         << "transport_cpu_seconds" << endl;
+
+ofstream StepOrderData(StepOrderName);
+StepOrderData.precision(16);
+StepOrderData << "iteration,did_reinitialize,level,T,"
+              << "transport_abs_drift,transport_observed_rate,"
+              << "step_abs_drift,step_observed_rate,dVdt_abs" << endl;
+
+int iter = 0;
+if (!silent) cout << "Yes1!" << endl;
+ElasticityPDE(ux, uy, Rho);
+if (!silent) cout << "Yes2!" << endl;
+VelocityPDE(thetax, thetay, ux, uy, Rho);
+
+compliance[iter] = GetCompliance(ux, uy, Rho);
+Vol[iter] = GetVol(Rho);
+OutPutData(iter, compliance, Vol, object);
+
+while (iter < iterMax) {
+    if (!silent) cout << "Iter = " << iter << endl;
+    object << endl;
+    object << "Iter = " << iter << endl;
+
+    int transportIteration = iter;
+    real volumeBeforeTransport = GetVol(Rho);
+    real dVdtBefore = GetdV(ux, uy, thetax, thetay, Rho);
+    real divergenceConstraintBefore = GetdVDivergence(thetax, thetay, Rho);
+    real velocityComponentLinf = max(thetax[].linfty, thetay[].linfty);
+    int didReinitialize = ((iter-1)%8 == 0);
+
+    int doShadow = enableShadow
+                   && ((iter%shadowStride == 0) || didReinitialize);
+    if (doShadow) {
+        real previousProbeTransportDrift = -1.;
+        real previousProbeStepDrift = -1.;
+        for (int probeLevel=0; probeLevel<shadowLevels; ++probeLevel) {
+            real probeT = Titer/(2.^probeLevel);
+            phiProbeInput = phi;
+            LFDG(phiProbeTransport, phiProbeInput, thetax, thetay, probeT);
+            rhoProbeTransport = HeaviSide(phiProbeTransport);
+            real probeVolumeAfterTransport = GetVol(rhoProbeTransport);
+            real probeTransportDrift = abs(
+                probeVolumeAfterTransport-volumeBeforeTransport
+            );
+
+            phiProbeStep = phiProbeTransport;
+            if (didReinitialize) RedistanceConvert(phiProbeStep);
+            rhoProbeStep = HeaviSide(phiProbeStep);
+            real probeVolumeAfterStep = GetVol(rhoProbeStep);
+            real probeStepDrift = abs(
+                probeVolumeAfterStep-volumeBeforeTransport
+            );
+
+            real probeTransportRate = -1.;
+            real probeStepRate = -1.;
+            if (probeLevel > 0
+                && probeTransportDrift > 0.
+                && previousProbeTransportDrift > 0.) {
+                probeTransportRate = log(
+                    previousProbeTransportDrift/probeTransportDrift
+                )/log(2.);
+            }
+            if (probeLevel > 0
+                && probeStepDrift > 0.
+                && previousProbeStepDrift > 0.) {
+                probeStepRate = log(
+                    previousProbeStepDrift/probeStepDrift
+                )/log(2.);
+            }
+
+            StepOrderData << iter << "," << didReinitialize << ","
+                          << probeLevel << "," << probeT << ","
+                          << probeTransportDrift << ","
+                          << probeTransportRate << ","
+                          << probeStepDrift << "," << probeStepRate << ","
+                          << abs(dVdtBefore) << endl;
+            StepOrderData.flush;
+            previousProbeTransportDrift = probeTransportDrift;
+            previousProbeStepDrift = probeStepDrift;
+        }
+    }
+
+    real transportStart = clock();
+
+    phitest = phi;
+    LFDG(phi, phitest, thetax, thetay, Titer);
+    real transportCPU = clock()-transportStart;
+    RhoAfterTransport = HeaviSide(phi);
+    real volumeAfterTransport = GetVol(RhoAfterTransport);
+
+    if (didReinitialize) {
+        RedistanceConvert(phi);
+        if (!silent) cout << "Redistance End!" << endl;
+    }
+    Rho = HeaviSide(phi);
+    real volumeAfterReinit = GetVol(Rho);
+    ElasticityPDE(ux, uy, Rho);
+    iter++;
+    compliance[iter] = GetCompliance(ux, uy, Rho);
+    Vol[iter] = GetVol(Rho);
+
+    real stepSignedDrift = volumeAfterReinit-volumeBeforeTransport;
+    real stepAbsDrift = abs(stepSignedDrift);
+    real stepRelativeDrift = stepAbsDrift/max(1.e-30, Vol[0]);
+
+    TimeData << transportIteration << "," << meshScale << ","
+             << hmax << "," << hmin << "," << gamma << ","
+             << transportIteration*Titer << ","
+             << (transportIteration+1)*Titer << ","
+             << Titer << "," << Titer/5. << ",5,"
+             << volumeBeforeTransport << "," << volumeAfterTransport << ","
+             << volumeAfterReinit << "," << stepSignedDrift << ","
+             << stepAbsDrift << "," << stepRelativeDrift << ","
+             << volumeAfterTransport-volumeBeforeTransport << ","
+             << abs(volumeAfterTransport-volumeBeforeTransport) << ","
+             << dVdtBefore << "," << abs(dVdtBefore) << ","
+             << divergenceConstraintBefore << ","
+             << abs(divergenceConstraintBefore) << ","
+             << velocityComponentLinf << ","
+             << volumeAfterReinit-volumeAfterTransport << ","
+             << abs(volumeAfterReinit-volumeAfterTransport) << ","
+             << didReinitialize << "," << compliance[transportIteration] << ","
+             << compliance[iter] << "," << transportCPU << endl;
+    TimeData.flush;
+
+    object << "Titer = " << Titer << endl;
+    OutPutData(iter, compliance, Vol, object);
+
+    if (writeVisual) {
+        plot(Rho, fill=1, value=1, cmm="Rho_"+iter);
+        string filename = "./figure/Rho_"+iter+".vtu";
+        string filename2 = "./figure/phi_"+iter+".vtu";
+        savevtk(filename, Th, Rho);
+        // savevtk(filename2, Th, phi);
+    }
+
+    VelocityPDE(thetax, thetay, ux, uy, Rho);
+}
+
+ofstream OutMatlab(ModelMatLabName);
+OutMatlab << "Num = " << iter+1 << endl;
+for (int i=0; i<=iter; ++i) {
+    OutMatlab << "Volume(" << i+1 << ") = " << Vol[i] << "; ";
+    OutMatlab << "compliance(" << i+1 << ") = " << compliance[i] << ";" << endl;
+}
