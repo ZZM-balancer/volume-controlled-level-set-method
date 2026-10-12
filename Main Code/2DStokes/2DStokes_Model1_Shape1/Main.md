@@ -108,8 +108,8 @@ macro div(ux, uy) ( dx(ux) + dy(uy) ) //
 |Phih|$\phi$或$\rho$所在的有限元空间|
 |Sth|Uh $\times$ P1h|
 ~~~freefem
-// first label meanings:  1 = Dirichlet, 2 = in, 3 = out
-// second label meanings: 1--(gx1, gy)  2--(gx2, gy)
+// first label meanings: 1 = no-slip wall, 2 = prescribed inlet, 3 = natural outlet
+// inlet labels: 21--(gx1, gy), 22--(gx2, gy); outlet labels: 31, 32 (natural)
 real hbd = 1. / 6.;
 border bdrightwall1(t = 0, hbd)       {x = 1.5; y = t; label = 1;}
 border bdout1(t = hbd, 2*hbd)         {x = 1.5; y = t; label = 31;}
@@ -183,6 +183,9 @@ savevtk("./figure/Rho_0.vtu", Th, Rho);
 |![](Rho_0.png)|
 
 ### 5.2 速度-压力计算
+
+入口标签为 21、22，分别施加下方代码中的两组抛物线速度；出口标签为 31、32。壁面标签为 1，施加零速度。出口不施加速度 Dirichlet 条件，而采用与梯度形式黏性项对应的齐次自然条件 $\nabla u\,n-pn=0$（本代码黏度系数为 1）；该条件由弱形式自然给出，无需增加出口 `on(...)` 或边界载荷项。速度测试函数仅在入口和壁面为零，出口保持自由；压力空间采用 $L^2(D)$，不另施加零均值约束。代码保留原有的 $10^{-8}$ 压力稳定化项。形状下降方向在外边界的零值约束保持原样。
+
 |变量名|作用|
 |:---:|:---:|
 |[ux, uy]|速度|
@@ -199,7 +202,7 @@ $$
 \begin{align*}
 \begin{cases}
 \int_D \nabla u : \nabla v dx - \int_D p \ \texttt{div} \ v dx + \int_D \alpha(\rho) u \cdot v dx = \int_D f \cdot v dx & \forall v \in [H_{\partial D_D}^1(D)]^2 \\
-\int_D q \ \texttt{div} \ u dx = 0 & \forall q \in L_0^2(D)
+\int_D q \ \texttt{div} \ u dx = 0 & \forall q \in L^2(D)
 \end{cases}
 \end{align*}
 $$
@@ -225,14 +228,14 @@ int2d(Th)(
             - q * div(ux, uy) 
             - p * q * 1e-8
         )
-+ on(21, 31, ux = gx1, uy = gy)
-+ on(22, 32, ux = gx2, uy = gy)
++ on(21, ux = gx1, uy = gy)
++ on(22, ux = gx2, uy = gy)
 + on(1, ux = 0, uy = 0);
 
 varf StokesRHS(<[ux, uy], [p]>, <[vx, vy], [q]>) = 
 int2d(Th) (fx * vx + fy * vy)
-+ on(21, 31, ux = gx1, uy = gy)
-+ on(22, 32, ux = gx2, uy = gy)
++ on(21, ux = gx1, uy = gy)
++ on(22, ux = gx2, uy = gy)
 + on(1, ux = 0, uy = 0);
 
 matrix A1m = StokesSteady(Sth, Sth);
