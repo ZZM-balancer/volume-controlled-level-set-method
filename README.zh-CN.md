@@ -43,11 +43,6 @@ for Markdown execution support introduced in version 4.15.
 
 ## Execution Reference / 运行方式参考
 
-以下命令用于说明作者的运行流程。许可证仅允许下载和查看；其他使用（包括运行代码）需要事先取得书面许可。
-
-The commands below document the authors' workflow. The license grants download
-and inspection rights only; execution and other uses require prior written permission.
-
 在目标算例目录内运行，确保相对网格路径正确：
 
 Run from the selected example directory so that relative paths resolve:
@@ -101,8 +96,12 @@ A clean checkout has not been verified to reproduce all supplied figures.
 
 ## License and Citation / 许可证与引用
 
-本项目原创材料采用自定义 [Download and Inspection Only License](LICENSE)：允许下载和查看未修改副本；禁止修改、改编、衍生作品和再分发，其他使用需要事先获得书面许可。GitHub 平台条款和法律要求的权利除外。第三方材料遵循各自许可证。
+本项目采用 [MIT License](LICENSE)，允许下载、运行、修改和再分发，但须保留许可证要求的版权与许可声明。第三方材料遵循各自许可证。
 
-This is a restrictive source-available license, not an open-source license.
-The copyright holders may continue maintaining their own materials.
+The MIT License permits use and modification of downloaded copies. It does not
+grant write access to the owner's GitHub repository. Upstream changes remain
+under the owner's control; suggestions can be submitted as issues or pull requests.
+
+他人不会因下载或 fork 而获得你名下仓库的写入权限。未经授予写入权限，不能直接修改该仓库；Pull Request 需要由有权限的维护者决定是否合并。
+
 Publication citation metadata has not yet been specified / 论文引用信息待补充。

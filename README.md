@@ -59,9 +59,6 @@ established. Plugin availability and solver support depend on the installation.
 
 ## Running an Example
 
-The commands below document the authors' workflow. The license grants download
-and inspection rights only; execution and other uses require prior written permission.
-
 Run FreeFEM from the example directory so that relative mesh and output paths
 resolve correctly. Create `Output/`, `figure/`, and `matlab/` if they are absent.
 
@@ -155,11 +152,12 @@ require matching solver environments and running the original iteration counts.
 
 ## Citation and License
 
-The original project materials are provided under the custom
-[Download and Inspection Only License](LICENSE). Downloading and inspecting
-unmodified copies is permitted. Modification, derivative works, redistribution,
-and other uses require prior written permission, except for rights required by
-applicable law or GitHub's Terms of Service. This is not an open-source license.
+The project is provided under the [MIT License](LICENSE), permitting download,
+use, modification, and redistribution subject to its notice requirements.
 Separately licensed third-party materials retain their own terms.
+
+The license does not grant write access to this GitHub repository. Changes to
+the upstream repository remain under the owner's control. Suggestions may be
+submitted as issues or pull requests.
 
 Publication citation metadata has not yet been specified.
