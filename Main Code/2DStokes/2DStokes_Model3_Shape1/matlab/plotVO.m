@@ -12,7 +12,7 @@ figure('Position',[100,100,900,650]);
 
 plot(0:1:Num-1, drag(1:Num), "LineWidth", 2.5)
 xlabel("Iteration number $n$","Interpreter","latex","FontSize",18,'FontWeight','bold');
-ylabel("Drag","Interpreter","latex","FontSize",18,'FontWeight','bold');
+ylabel("Stokes objective","Interpreter","latex","FontSize",18,'FontWeight','bold');
 ylim([0,20]);
 
 ax = gca;
